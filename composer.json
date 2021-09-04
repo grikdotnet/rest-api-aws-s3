@@ -1,0 +1,20 @@
+{
+    "name": "gri/aws-integration",
+    "description": "Sample REST API with AWS S3",
+    "type": "project",
+    "require": {
+        "aws/aws-sdk-php": "^3.191"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Gri\\AwsIntegration\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Grigori Kochanov",
+            "email": "grigori@grik.net"
+        }
+    ]
+}
