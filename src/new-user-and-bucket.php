@@ -1,71 +1,109 @@
 <?php
 
+// AWS SDK assumes that credentials are provided in variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+// either in the ~/.aws/credentials file or in the environment variables.
+// The AWS user should have privileges for IAM and S3 to manage users and buckets.
+
+
 require '../vendor/autoload.php';
 
 use Aws\Iam\IamClient, Aws\Exception\AwsException;
 
-// Environment variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-// must contain credentials
-// for an AWS user with full privileges for IAM and S3
-
 // AWS configuration values
-$AWS_ACCOUNT_ID = 1234567890;
 $AWS_API_CONSUMERS_GROUP = 'api-consumers';
-$AWS_BUCKET_NAME_PREFIX = 'api-';
+$AWS_BUCKET_NAME_PREFIX = 'gk-test-';
+const BUCKET_LIFECYCLE_DAYS = 62; // 2 months
 
 
 // In a real application consumer details come from a message bus
-$consumer_login = 'user@example.com';
-$consumer_id = 123;
+$customer_login = 'user@example.com';
+$customer_id = 123;
 
 $sdk = new Aws\Sdk([
     'profile' => 'default',
     'region' => 'us-east-2',
-    'version' => '2010-05-08',
+//    'debug'   => true,
 ]);
-$iam = $sdk->createIam();
-$s3 = $sdk->createS3();
 
 // Create an AWS user for a new client subscription
 try {
-    $iam->createUser(array(
-        'UserName' => $consumer_login,
-    ));
+    $iam = $sdk->createIam(['version' => '2010-05-08']);
+}catch (AwsException $e) {
+    error_log($e->getMessage());
+    exit;
+}
+
+
+try {
+    $result = $iam->createUser(['UserName' => $customer_login]);
+    $consumer_arn = $result['User']['Arn'];
+
     $iam->addUserToGroup([
         'GroupName' => $AWS_API_CONSUMERS_GROUP,
-        'UserName' => $consumer_login,
+        'UserName' => $customer_login,
     ]);
     // Create API keys
     $keys = $iam->createAccessKey([
-        'UserName' => $consumer_login,
+        'UserName' => $customer_login,
     ]);
-}catch (AwsException $e) {
-    // output error message if fails
-    error_log($e->getMessage());
+
+    // Here I should provide keys to the consumer some way
+    $consumer_credentials = [
+        'key' => $keys['AccessKey']['AccessKeyId'],
+        'secret' => $keys['AccessKey']['SecretAccessKey'],
+    ];
+
+    echo 'IAM user created: ', $consumer_arn,PHP_EOL,
+        'API Key: ',$consumer_credentials['key'],PHP_EOL,
+        'Secret key: ',$consumer_credentials['secret'],PHP_EOL
+    ;
+
+    // Handle the eventual consistancy in AWS, S3 will find a new user after a timeout
+    sleep(10);
+
+} catch (AwsException $e) {
+    if($e->getAwsErrorCode() == 'EntityAlreadyExists') {
+        try {
+            $result = $iam->getUser(['UserName' => $customer_login]);
+            $consumer_arn = $result['User']['Arn'];
+            echo 'IAM user found: ', $consumer_arn,PHP_EOL;
+        } catch (AwsException $e) {
+            error_log($e->getMessage());
+            exit;
+        }
+    } else {
+        error_log($e->getMessage());
+        exit;
+    }
 }
 
-$user_credentials = [
-    'key' => $keys['AccessKey']['AccessKeyId'],
-    'secret' => $keys['AccessKey']['SecretAccessKey'],
-];
+
 
 // Create an AWS bucket
-$bucketName = $AWS_BUCKET_NAME_PREFIX . $consumer_id;
+$bucketName = $AWS_BUCKET_NAME_PREFIX . $customer_id;
 try {
-    $s3->createBucket([
+    $s3 = $sdk->createS3(['version'=> '2006-03-01']);
+
+    $s3->createBucket(['Bucket' => $bucketName]);
+
+    $s3->putPublicAccessBlock([
         'Bucket' => $bucketName,
+        'PublicAccessBlockConfiguration' => [
+            'BlockPublicAcls' => true,
+            'BlockPublicPolicy' => true,
+            'IgnorePublicAcls' => true,
+            'RestrictPublicBuckets' => true,
+        ],
     ]);
-    $s3->putBucketPolicy([
-        'Bucket' => $bucketName,
-        'Policy' => '{
+
+    $policy = '{
         "Version": "2012-10-17",
-            "Id": "PolicyId",
             "Statement": [
                 {
                     "Sid": "Stmt'.time().'",
                     "Effect": "Allow",
                     "Principal": {
-                        "AWS": "arn:aws:iam::'.$AWS_ACCOUNT_ID.':user/'.$consumer_id.'"
+                        "AWS": "'.$consumer_arn.'"
                     },
                     "Action": [
                         "s3:ListBucket",
@@ -78,9 +116,45 @@ try {
                     ]
                 }
             ]
-        }',
+        }';
+
+    $s3->putBucketPolicy([
+        'Bucket' => $bucketName,
+        'Policy' => $policy,
     ]);
 
+    $result = $s3->putBucketLifecycle(
+        [
+            'Bucket' => $bucketName,
+            'LifecycleConfiguration' => [
+                'Rules' => [
+                    [
+                        'AbortIncompleteMultipartUpload' => [
+                            'DaysAfterInitiation' => BUCKET_LIFECYCLE_DAYS,
+                        ],
+                        'ID' => 'delete_after_'.BUCKET_LIFECYCLE_DAYS.'_days',
+                        'Status' => 'Enabled',
+                        'Prefix' => ''
+                    ],
+                ],
+            ],
+        ]
+    );
+
+    $s3->putBucketEncryption([
+        'Bucket' => $bucketName,
+        'ServerSideEncryptionConfiguration' => [
+            'Rules' => [['ApplyServerSideEncryptionByDefault' => ['SSEAlgorithm' => 'AES256']]]
+        ]
+    ]);
+
+    echo 'S3 bucket created: ',$bucketName,PHP_EOL;
+
 } catch (AwsException $e) {
-    return 'Error: ' . $e->getAwsErrorMessage();
+    if ($e->getAwsErrorCode() != 'BucketAlreadyOwnedByYou') {
+        error_log($e->getMessage());
+        exit;
+    }
+    echo 'S3 bucket exists: ',$bucketName,PHP_EOL;
 }
+
